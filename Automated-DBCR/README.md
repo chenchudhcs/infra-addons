@@ -86,6 +86,14 @@ DBCR_ID           | FILENAME                  | BUILD_NUMBER                  | 
 
 3. Any file deletion of sql’s from svn/git is easily tracked, which helps a lot in maintaining the dbcr’s and keep infra team always informed.
 
+#Ant targets of Interest in the xml attached
+
+1. add-inserts-to-dbcrs - This target is used to add the insert statement to the end of the Approved DBCR so that it's entry can be made into the custom tracker table
+
+2. replace-dbcr-tokens - This target is used to replace environment specific tokens, to provide you an example. When we require environment specific entries we use tokens in the sql's and those are replaced on runtime based on the environment variable passed before applying ot the DB
+
+3. run-dbcr-diff-update-target-env-porperties - This target fetches the diff between the deployment package and the already available inserts in the DB in the DBCRTRACKER table.
+
 
 
 
