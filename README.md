@@ -46,6 +46,48 @@ At times one team member is aligned to perform daily deployments.
 
 Example: 201502011600-323232.sql file represents a DBCR (323232) that has been approved on 1st Feb 2015 at 4:00 PM
 
+#Solution  - Process Flow
+
+Pre-build Phase - 
+
+1. Developer Raises DBCR
+2. Arch or DBA reviews the DBCR and assigns it further to Infra Team for inclusion in the Build.
+
+
+Build Phase -
+
+1. Get the latest of approved DBCR
+2. Package all the approved SQl files till date
+
+Pre-Deploy Phase -
+
+1. Select the DBCR Filenames from DBCRTRACKER TABLE of the environment
+2. Find the diff of the filenames present in the deployment packet vs the file list in the DB
+3. validate if the diff filelist is part of the  deployment packet
+
+Deploy Phase
+
+1. Iterate Over list of DBCR's to be applied based on the timestamp (to figure out the sequence of the DBCR)
+2. Update the SQL files with insert into DBCRTRACKER table
+3. Run DBCR (We use ant task here)
+
+#Sample data model for DBCRTRACKER table:
+
+DBCR_ID           | FILENAME                  | BUILD_NUMBER                  | DATE_CREATED 
+
+1. Filename: column is added since at times there can be multiple SQL scripts as a part of the DBCR.
+2. Build number: build version, SVN version or any other tracking parameter can be used. Ideally it should be same tracking version being used for rest of the code. This helps in identifying when the DBCR was applied to the environment
+
+#Key success factors and Gaps
+
+1. Success of this process lies in the process of adhering to one single rule: Never modify an approved DBCR or manually apply DBCR’s to any environment.
+
+2. Developers should submit DBCR’s on a daily basis instead of weekly (right before the build)
+
+3. Any file deletion of sql’s from svn/git is easily tracked, which helps a lot in maintaining the dbcr’s and keep infra team always informed.
+
+
+
 
 
 
