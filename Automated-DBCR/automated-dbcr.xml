@@ -1,0 +1,1205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="custom-build-tasks" default="pre-deploy" basedir=".">
+	<!-- Task definition for all the contributed tasks used in this file for instance for task, var task etc. -->
+	<taskdef resource="net/sf/antcontrib/antlib.xml"/>
+	<!-- Overwrite existing private properties with external properties -->
+	<copy file="${wcs.ext.props.path}/external.properties" tofile="${basedir}/deploy-${target.env}.private.properties" verbose="true" overwrite="true" failonerror="false"/>
+	<!-- Importing the main wcbd deplpoy xml to use common targets from it. -->
+	
+	<concat destfile="${basedir}/deploy-${target.env}.properties" force="yes">
+		<filelist dir="${basedir}" files="common.properties,${target.env}.properties"/>
+	</concat>
+	
+	<property file="${basedir}/deploy-${target.env}.properties" />
+	
+	
+	<if>
+		<equals arg1="${delta.deploy}" arg2="true"/>
+			<then>
+				<property file="${basedir}/../baseline.properties" />
+				<mkdir dir="${baseline.dir}" />
+				<mkdir dir="${baseline.dir}/source" />
+			</then>
+	</if>
+
+	<import file="wcbd-deploy.xml"/>
+	
+	<!-- Custom Properties defined by us -->
+	<!-- Check if count in xdbcrtracker is zero. If it is, set property apply_dbcr_types = ALL. Otherwise do nothing. -->
+	<property name="python.cr.common.dir" value="${basedir}/scripts" />
+	<property name="dbcrTrackerCountFile" value="dbcrCount.lst"/>
+	<property name="run.custom.was.py.config" value="true"/>
+	<trycatch property="dbcrCountErr.msg">
+		<try>
+			<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false" output="${dbcrTrackerCountFile}">SELECT 'dbcrTrackerCount = ' || count(1) FROM xdbcrtracker;</sql>
+		</try>
+		<catch>
+			<if>
+				<and>
+					<contains string="${dbcrCountErr.msg}" substring="ORA-00942" casesensitive="false"/>
+					<not>
+						<contains string="${target.env}" substring="AUTH" casesensitive="false"/>
+					</not>
+				</and>
+				<then>
+					<echo message="Table not found and environment is not auth."/>
+					<var name="apply_dbcr_types" unset="true"/>
+					<property name="apply_dbcr_types" value="ALL"/>
+				</then>
+				<else>
+					<echo message="Error while retrieving dbcr count. Error is: ${dbcrCountErr.msg}"/>
+				</else>
+			</if>
+		</catch>
+	</trycatch>
+	<property file="${dbcrTrackerCountFile}"/>
+	<delete file="${dbcrTrackerCountFile}"/>
+	<if>
+		<and>
+			<equals arg1="${dbcrTrackerCount}" arg2="0"/>
+			<not>
+				<contains string="${target.env}" substring="AUTH" casesensitive="false"/>
+			</not>
+		</and>
+		<then>
+			<echo message="Table XDBCRTRACKER is empty and environment is not auth."/>
+			<var name="apply_dbcr_types" unset="true"/>
+			<property name="apply_dbcr_types" value="ALL"/>
+		</then>
+	</if>
+	<property name="wc.dest.file" value="${basedir}/source/wc.ear/xml/config/wc-server.xml"/>
+	<property name="was.security.file" value="${basedir}/../_NonCodeAsset/ConfigScripts/common/was-security.xml"/>
+	<property name="db.details.file" value="${basedir}/../_NonCodeAsset/ConfigScripts/common/db-details.xml"/>
+	<property name="wc.catalog.component.dest.file" value="${basedir}/source/wc.ear/xml/config/com.ibm.commerce.catalog-ext/wc-component.xml"/>
+	<property name="dataload.sql.dir" value="${basedir}/source/dataload/sql/common/"/>
+	<property name="internal.execute.always.sql.dir" value="${basedir}/../_NonCodeAsset/Buildscript/custom_triggers"/>
+	<property name="dataload.rollback.sql.dir" value="${basedir}/source/dataload/sql/common/rollback/"/>
+	<property name="rollback.pkg.file.dir" value="${basedir}/source/dataload/sql/common/rollback/pakages"/>
+	<property name="dbcrRollbackSqlOutputFile" value="rollbackdbcrlist.txt"/>
+	<!--
+	This target is the main target and calls all other rollback-dbcr-deploy
+	tasks in a sequence to complete rollback-dbcr-deploy step. 
+	-->
+	<target name="rollback-dbcr-target" depends="get-dbcr-rollback-list-target,add-delete-statement-to-rollback-dbcrs,replace-tobeProvided,replace-rollback-dbcr-tokens,run-rollback-dbcr-on-all-environments,rollback-pakage-target"/>
+	<!-- Get the list of rollback dbcrs from xdbcrtracker table as per the build label -->
+	<target name="get-dbcr-rollback-list-target">
+	<property name="dbcrSqlOutputFile" value="rollbackdbcrlist.txt"/>
+		<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false" output="${dbcrRollbackSqlOutputFile}">SELECT lower(xdbcrtracker.filename) FROM xdbcrtracker WHERE lower(build_label) = '${build.label}' order by filename DESC ; </sql>
+		<replace file="${dbcrRollbackSqlOutputFile}" token=".sql" value="-R.sql" />
+	</target>
+	<!-- Add the delete statement to sql file -->
+	<target name="add-delete-statement-to-rollback-dbcrs">
+		<if>
+			<equals arg1="${run.dataload.sql.common}" arg2="true" />
+			<then>
+				<fileset id="list.rollback.sql.files" dir="${dataload.rollback.sql.dir}">
+					<include name="*.SQL"/>
+					<include name="*.sql"/>
+					<exclude name="pkg_*.*"/>
+					<exclude name="PKG_*.*"/>
+				</fileset>
+		<!-- Rollback sql file list file loaded -->		
+		<loadfile property="rollback.sql.file.list" srcfile="${dbcrRollbackSqlOutputFile}"/>
+		<!-- Loop for each file -->
+		<for list="${rollback.sql.file.list}" param="file" delimiter="${line.separator}">
+			<sequential>
+			    <!-- file validation in the folder -->
+				<!-- Define regex to find the artifact id (from jira) -->
+				<propertyregex property="jira-id" input="@{file}" regexp=".*-([0-9]*).*.R.*" select="\1" casesensitive="false"/>
+				<loadfile srcFile="${dataload.rollback.sql.dir}/@{file}" property="fileContent"/>
+				<!-- Check if the current file contains the delete statement to XDBCRTRACKER table-->
+				<condition property="delete.regex.found">
+					<and>
+						<matches pattern="DELETE[ \t]FROM[ \t]XDBCRTRACKER[ \t](.*)" string="${fileContent}"/>
+						<not>
+							<matches pattern="--.*DELETE[ \t]FROM[ \t]XDBCRTRACKER[ \t](.*)" string="${fileContent}"/>
+						</not>
+					</and>
+				</condition>
+				
+				<condition property="ddl.check">
+						<matches pattern="(^ALTER|^CREATE|^DROP|^FLASHBACK|ANALYZE|ASSOCIATE[ \t]STATISTICS|AUDIT|COMMENT|DISASSOCIATE[ \t]STATISTICS|GRANT|NOAUDIT|PURGE|RENAME|REVOKE|TRUNCATE|UNDROP)(.*)" string="${fileContent}" multiline="true"/>
+				</condition>
+				
+				<!-- Create an delete statement for XDBCRTRACKER if the above regex evaluevates to false. Do nothing when true. -->
+				<if>
+					<equals arg1="${delete.regex.found}" arg2="true"/>
+					<then/>
+					<else>
+						<if>
+							<equals arg1="${ddl.check}" arg2="true"/>
+							<then>
+							<echo file="${dataload.rollback.sql.dir}/@{file}" append="true">${line.separator} DELETE FROM XDBCRTRACKER WHERE filename= '@{file}'</echo>
+							<replace file="${dataload.rollback.sql.dir}/@{file}" token="-R.sql" value=".sql" />
+							</then>
+							<else>
+							<echo file="${dataload.rollback.sql.dir}/@{file}" append="true">${line.separator} DELETE FROM XDBCRTRACKER WHERE filename= '@{file}'</echo>
+							<replace file="${dataload.rollback.sql.dir}/@{file}" token="-R.sql" value=".sql" />
+							</else>
+						</if>
+						<if>
+							<contains string="@{file}" substring="proc" casesensitive="false"/>
+							<then>
+								<echo file="${dataload.rollback.sql.dir}/@{file}" append="true">${line.separator}/${line.separator}</echo>
+							</then>
+							<else>
+								<echo file="${dataload.rollback.sql.dir}/@{file}" append="true">;${line.separator}</echo>
+							</else>
+						</if>
+					</else>
+				</if>
+				<var name="fileContent" unset="true"/>
+				<var name="delete.regex.found" unset="true"/>
+				<var name="jira-id" unset="true"/>
+				<var name="ddl.check" unset="true"/>
+			</sequential>
+		</for>
+		</then>
+		</if>
+	</target>
+	<!-- Replece tokens in the rollback SQL files -->
+	<target name="replace-rollback-dbcr-tokens">
+		<if>
+		<equals arg1="${dataload.rollback.sql.dir}" arg2="false" />
+			<then>
+				<replace dir="${dataload.rollback.sql.dir}" replacefilterfile="${wcs.ext.props.path}/external.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+				<replace dir="${dataload.rollback.sql.dir}" replacefilterfile="${basedir}/${target.env}.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+				<replace dir="${dataload.rollback.sql.dir}" replacefilterfile="${basedir}/deploy-${target.env}.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+			</then>
+		</if>		
+	</target>
+	<!-- Rollback DBCR execution -->
+	<target name="run-rollback-dbcr-on-all-environments">
+		<!-- Rollback sql file list file loaded -->		
+		<loadfile property="rollback.sql.file.list" srcfile="${dbcrRollbackSqlOutputFile}"/>
+			<for list="${rollback.sql.file.list}" param="sqlfile" delimiter="${line.separator}">
+				<sequential> 
+				<echo message="${dataload.rollback.sql.dir}/@{sqlfile}"/>
+					<antcall target="dataload.sql">
+						<param name="src.file" value="${dataload.rollback.sql.dir}/@{sqlfile}"/>
+						<param name="sql.onerror" value="continue"/>
+					</antcall>
+				</sequential>
+			</for> 
+	</target>
+    <target name="rollback-pakage-target">
+        <fileset id="auth.pakage.list" dir="${rollback.pkg.file.dir}">
+        <exclude name="pkg*-rto*.sql"/>
+        <include name="pkg*-ato*.sql"/>
+        <include name="*.sql"/>
+        </fileset>
+        <fileset id="live.pakage.list" dir="${rollback.pkg.file.dir}">
+        <exclude name="pkg*-ato*.sql"/>
+        <include name="pkg*-rto*.sql"/>
+        <include name="*.sql"/>
+        </fileset>
+        <property name="rollback.auth.pkg.sql.file.list" refid="auth.pakage.list"/>
+        <property name="rollback.live.pkg.sql.file.list" refid="live.pakage.list"/>
+            <if>
+            <contains string="${target.env}" substring="AUTH" casesensitive="false"/>
+            <then>
+            <echo>${rollback.auth.pkg.sql.file.list}</echo>
+            <for param="file" list="${rollback.auth.pkg.sql.file.list}" delimiter=";">
+            <sequential>
+            <echo message="@{file}"/>
+            <antcall target="dataload.sql">
+                <param name="src.file" value="${rollback.pkg.file.dir}/@{file}"/>
+                <param name="sql.onerror" value="continue"/>
+            </antcall>
+            </sequential>
+            </for>
+            </then>
+            <else>
+            <echo>${rollback.auth.pkg.sql.file.list}</echo>
+			<for param="file" list="${rollback.live.pkg.sql.file.list}" delimiter=";">
+            <sequential>
+            <echo message="@{file}"/>
+            <antcall target="dataload.sql">
+                <param name="src.file" value="${rollback.pkg.file.dir}/@{file}"/>
+                <param name="sql.onerror" value="continue"/>
+            </antcall>
+            </sequential>
+            </for>
+            </else>
+            </if>
+        </target>
+	<!--
+ **************************************************************************
+** This target is the main target and calls all other pre deploy tasks in a **
+** sequence to complete pre-deploy step.                                    **
+**************************************************************************** 
+	-->
+	<target name="pre-deploy" depends="cobertura-instrument,custom-updates-to-xdbcrtracker,add-inserts-to-dbcrs,replace-tobeProvided,replace-dbcr-tokens,replace-wc-server-tokens,run-mandatory-dbcr-on-all-environments,run-dbcr-diff-update-target-env-porperties,run-acp-diff-update-target-env-porperties,run-massload-diff-update-target-env-porperties,run-acug-diff-update-target-env-porperties,run-python-cr-diff-update-target-env-porperties"/>
+	<property name="cobertura.dir" value="${basedir}/lib/cobertura"/>
+	<!-- Define classpath to be used for cobertura -->
+	<path id="cobertura.classpath">
+		<fileset dir="${cobertura.dir}">
+			<include name="cobertura.jar"/>
+			<include name="lib/**/*.jar"/>
+		</fileset>
+	</path>
+	<taskdef classpathref="cobertura.classpath" resource="tasks.properties"/>
+	<!--
+ **************************************************************************
+	Target to analyze code using Cobertura.
+	Will only run if property run.cobertura is true
+	************************************************************************** 
+	-->
+	
+	<!--<target name="merge-all-properties" >
+		<mkdir dir="${baseline.dir}" />
+		<mkdir dir="${baseline.dir}/source" />
+		<concat destfile="${basedir}/deploy-${target.env}.properties" force="yes">
+			<filelist dir="${basedir}" files="common.properties,${target.env}.properties"/>
+        </concat>
+	</target>-->
+	
+	<target name="cobertura-instrument">
+		<if>
+			<equals arg1="${run.cobertura}" arg2="true"/>
+			<then>
+				<cobertura-instrument>
+					<ignore regex="org.apache.log4j.*"/>
+					<fileset dir="${full.ear.dir}">
+						<include name="MSAddCardDataObjects.jar"/>
+						<include name="MSSubmitPaymentDataObjects.jar"/>
+						<include name="WebSphereCommerceServerExtensionsLogic.jar"/>
+					</fileset>
+					<fileset dir="${full.module.dir}">
+						<include name="WebSphereCommerceServerExtensionsData.jar"/>
+					</fileset>
+				</cobertura-instrument>
+				<!--Copy cobertura.jar to be part of the lib directory of was application -->
+				<copy file="${cobertura.dir}/cobertura.jar" todir="${full.ear.dir}/lib"/>
+				<!--Copy coberturaFlush.war to be deployed as part of the Application-->
+				<!--<copy file="${cobertura.dir}/coberturaFlush.war" todir="${full.module.dir}"/>-->
+				<!--Edit the property to deploy this war on runtime -->
+				<!-- Below war module is no longer required to be deployed
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="new.web.module.list=(.*)" replace="new.web.module.list=coberturaFlush" byline="true"/>
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="context.root.mapping.list=(.*)" replace="context.root.mapping.list=coberturaFlush.war:/coberturaFlush" byline="true"/>
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="virtual.host.mapping.list=(.*)" replace="virtual.host.mapping.list=coberturaFlush.war:VH_guest" byline="true"/>
+				-->
+			</then>
+			<else>
+				<!--
+<replaceregexp file="${basedir}/deploy-${target.env}.properties"
+               match="ejb.module.delete.list=(.*)"
+			   replace="ejb.module.delete.list=cobertura"
+               byline="true"/>
+			   
+		<replaceregexp file="${basedir}/deploy-${target.env}.properties"
+               match="web.module.delete.list=(.*)"
+			   replace="web.module.delete.list=coberturaFlush"
+               byline="true"/>
+				-->
+			</else>
+		</if>
+	</target>
+	<target name="custom-updates-to-xdbcrtracker">
+		<antcall target="dataload.sql">
+			<param name="src.file" value="${internal.execute.always.sql.dir}/update_xdbcrtracker_table.sql"/>
+			<param name="sql.onerror" value="continue"/>
+		</antcall>
+	</target>
+	<!--
+ **************************************************************************
+** This target adds the insert statements at the end of the DBCR file.       **
+** Insert statement is used to put the entry of the DBCR into the dbcrtracker**
+** table after it is applied on the system.                                  **
+**************************************************************************** 
+	-->
+	<target name="add-inserts-to-dbcrs">
+		<if>
+			<equals arg1="${run.dataload.sql.common}" arg2="true" />
+			<then>
+				<fileset id="list.sql.files" dir="${dataload.sql.dir}">
+					<include name="*.SQL"/>
+					<include name="*.sql"/>
+					<exclude name="**/updateDBConfigurations.sql"/>
+					<exclude name="pkg_*.*"/>
+					<exclude name="PKG_*.*"/>
+				</fileset>		
+		<!--
+ remove directory information in the dbcr file list 
+		e.g foo/bar/B.sql to B.sql and so on				
+		-->
+		<pathconvert pathsep="," property="processed.dbcr.files.list" refid="list.sql.files">
+			<mapper type="flatten"/>
+		</pathconvert>
+		<!-- Loop for each file -->
+		<for list="${processed.dbcr.files.list}" param="file" delimiter=",">
+			<sequential>
+				<!-- Define regex to find the artifact id (from RS3) -->
+				<propertyregex property="rs3-id" input="@{file}" regexp="\-([0-9]*).*" select="\1" casesensitive="false"/>
+				<loadfile srcFile="${dataload.sql.dir}/@{file}" property="fileContent"/>
+				<!-- Check if the current file contains the insert statement to XDBCRTRACKER table-->
+				<condition property="insert.regex.found">
+					<and>
+						<matches pattern="INSERT[ \t]INTO[ \t]XDBCRTRACKER[ \t](.*)" string="${fileContent}"/>
+						<not>
+							<matches pattern="--.*INSERT[ \t]INTO[ \t]XDBCRTRACKER[ \t](.*)" string="${fileContent}"/>
+						</not>
+					</and>
+				</condition>
+				
+				<condition property="ddl.check">
+						<matches pattern="(^ALTER|^CREATE|^DROP|^FLASHBACK|ANALYZE|ASSOCIATE[ \t]STATISTICS|AUDIT|COMMENT|DISASSOCIATE[ \t]STATISTICS|GRANT|NOAUDIT|PURGE|RENAME|REVOKE|TRUNCATE|UNDROP)(.*)" string="${fileContent}" multiline="true"/>
+				</condition>
+				<!-- Create an insert statement for XDBCRTRACKER if the above regex evaluevates to false. Do nothing when true. -->
+				<if>
+					<equals arg1="${insert.regex.found}" arg2="true"/>
+					<then/>
+					<else>
+						<if>
+							<equals arg1="${ddl.check}" arg2="true"/>
+							<then>
+							<echo file="${dataload.sql.dir}/@{file}" append="true">${line.separator}INSERT INTO XDBCRTRACKER (dbcr_id, filename, build_label, created_date, last_updated, dbcr_type) VALUES (${rs3-id}, '@{file}', '@BUILD_LABEL@', SYSDATE, SYSDATE, 'DDL')</echo>
+							</then>
+							<else>
+							<echo file="${dataload.sql.dir}/@{file}" append="true">${line.separator}INSERT INTO XDBCRTRACKER (dbcr_id, filename, build_label, created_date, last_updated, dbcr_type) VALUES (${rs3-id}, '@{file}', '@BUILD_LABEL@', SYSDATE, SYSDATE, '')</echo>
+							</else>
+						</if>
+						<if>
+							<contains string="@{file}" substring="proc" casesensitive="false"/>
+							<then>
+								<echo file="${dataload.sql.dir}/@{file}" append="true">${line.separator}/${line.separator}</echo>
+							</then>
+							<else>
+								<echo file="${dataload.sql.dir}/@{file}" append="true">;${line.separator}</echo>
+							</else>
+						</if>
+					</else>
+				</if>
+				<var name="fileContent" unset="true"/>
+				<var name="insert.regex.found" unset="true"/>
+				<var name="rs3-id" unset="true"/>
+				<var name="ddl.check" unset="true"/>
+			</sequential>
+		</for>
+		</then>
+		</if>
+	</target>
+	<!--
+ **************************************************************************
+** This target reads the env specific db properties file and replace the     **
+** tokens in all the sql's based on its exitence in the sql file. It also    **
+** replaced BUILD_LABEL in the insert query added earlier in the build process.
+**************************************************************************** 
+	-->
+	<target name="replace-dbcr-tokens">
+		<if>
+			<equals arg1="${run.dataload.sql.common}" arg2="true" />
+			<then>
+				<!-- Replace build number in insert queries added as a part of pre-build -->
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="@BUILD_LABEL@=(.*)" replace="@BUILD_LABEL@=${build.label}" byline="true"/>
+				<!-- TODO: Sapeksh: review the need of replacing filters from two files -->
+				<replace dir="${dataload.sql.dir}" replacefilterfile="${wcs.ext.props.path}/external.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+				<replace dir="${dataload.sql.dir}" replacefilterfile="${basedir}/${target.env}.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+				<replace dir="${dataload.sql.dir}" replacefilterfile="${basedir}/deploy-${target.env}.properties">
+					<include name="**/*.sql"/>
+					<include name="**/*.SQL"/>
+				</replace>
+			</then>
+		</if>		
+	</target>
+	<!--
+ **************************************************************************
+** This target reads the env specific properties file and replace the tokens **
+** in the wc-server.xml 													 **
+*************************************************************************** 
+	-->
+	<target name="replace-wc-server-tokens">
+		<!-- TODO: Sapeksh: review the need of replacing filters from two files -->
+		<replace file="${wc.dest.file}" replacefilterfile="${wcs.ext.props.path}/external.properties"/>
+		<replace file="${wc.dest.file}" replacefilterfile="${basedir}/${target.env}.properties"/>
+		<replace file="${wc.dest.file}" replacefilterfile="${basedir}/deploy-${target.env}.properties"/>
+		<replace file="${db.details.file}" replacefilterfile="${basedir}/deploy-${target.env}.properties"/>
+		<replace file="${db.details.file}" replacefilterfile="${basedir}/${target.env}.properties"/>
+		<replace file="${db.details.file}" replacefilterfile="${wcs.ext.props.path}/external.properties"/>
+		<replace file="${was.security.file}" replacefilterfile="${wcs.ext.props.path}/external.properties"/>
+		<replace file="${wc.catalog.component.dest.file}" replacefilterfile="${wcs.ext.props.path}/external.properties"/>
+		<replace file="${wc.catalog.component.dest.file}" replacefilterfile="${basedir}/${target.env}.properties"/>
+		<replace file="${wc.catalog.component.dest.file}" replacefilterfile="${basedir}/deploy-${target.env}.properties"/>
+	</target>
+	<!--
+ **************************************************************************
+** Executes the sql target to create two tables, dbcrtracker and             **
+** dataloadtracker which contains the entry of all dbcr's and dataload       **
+** run on the environment respectively. Note the sql.onerror property is set **
+** to continue so that the workflow continues even if those tables already   **
+** in the enviornment.      											     **
+*************************************************************************** 
+	-->
+	<target name="run-mandatory-dbcr-on-all-environments">
+		<!-- Create table XDBCRTRACKER and add appropriate constraints to it. Ignore error if already exists. -->
+		<antcall target="dataload.sql">
+			<param name="src.file" value="${internal.execute.always.sql.dir}/dbcrtracker.sql"/>
+			<param name="sql.onerror" value="continue"/>
+		</antcall>
+		<!-- Create table XDATALOADTRACKER and add appropriate constraints to it. Ignore error if already exists. -->
+		<antcall target="dataload.sql">
+			<param name="src.file" value="${internal.execute.always.sql.dir}/dataloadtracker.sql"/>
+			<param name="sql.onerror" value="continue"/>
+		</antcall>
+		<antcall target="dataload.sql">
+			<param name="src.file" value="${internal.execute.always.sql.dir}/crtracker.sql"/>
+			<param name="sql.onerror" value="continue"/>
+		</antcall>
+		<if>
+			<or>
+				<contains string="${apply_dbcr_types}" substring="AUTH" casesensitive="false"/>
+				<contains string="${target.env}" substring="AUTH" casesensitive="false"/>
+			</or>
+			<then>
+				<!-- Create triggers for including custom tables into stageprop. Will only be run on AUTH environments -->
+				<for param="sqlfile">
+					<path>
+						<fileset dir="${internal.execute.always.sql.dir}" includes="*proc.sql"/>
+					</path>
+					<sequential>
+						<antcall target="dataload.sql">
+							<param name="src.file" value="@{sqlfile}"/>
+							<param name="sql.onerror" value="continue"/>
+						</antcall>
+					</sequential>
+				</for>
+			</then>
+			<else>
+				<echo message="The Environment is Live hence not applying any triggers" level="info"/>
+			</else>
+		</if>
+	</target>
+	<!--
+ **************************************************************************
+** Target to identify the set of files to be run during the deployment. It   **
+** gets the list of DBCR's already applied from the XDBCRTRACKER table and   **
+** compares it to the list of files in the deployment packet to identify new **
+** SQL files to be applied.                                                  **
+**************************************************************************** 
+	-->
+	<target name="run-dbcr-diff-update-target-env-porperties">
+		<if>
+			<equals arg1="${run.dataload.sql.common}" arg2="true" />
+			<then>
+				<property name="dbcrSqlOutputFile" value="dbcrout.lst"/>
+				<!-- Get the list of DBCR's file names already applied in the DB  -->
+				<trycatch property="dbcrErr.msg">
+					<try>
+						<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false" output="${dbcrSqlOutputFile}">SELECT xdbcrtracker.filename FROM xdbcrtracker WHERE lower (filename) != 'updateDBConfigurations.sql' ;</sql>
+					</try>
+				<catch>
+					<failNL bundle="wcbd-deploy-messages" key="ERR_TEST_DB">
+						<arg value="${dbcrErr.msg}"/>
+					</failNL>
+				</catch>
+				</trycatch>
+		<!-- Get the list of files in the deployment packet -->
+				<if>
+					<and>
+						<isset property="apply_dbcr_types"/>
+						<length string="${apply_dbcr_types}" length="0" trim="true" when="gt"/>
+					</and>
+				<then>
+				<!--
+ Create list of sql files available in build packet and another list for sqls already applied on environment
+		 Only get files which are NOT runtime only (filename containing 'rto')
+		 Only run when the apply_dbcr_types property is set to Auth 
+				-->
+				<if>
+					<contains string="${apply_dbcr_types}" substring="AUTH" casesensitive="false"/>
+					<then>
+						<fileset id="resource.dir.dbcr.files.list" dir="${dataload.sql.common.dir}">
+							<include name="**/*.sql"/>
+							<include name="**/*.SQL"/>
+							<exclude name="rollback/*"/>
+							<exclude name="**/updateDBConfigurations.sql"/>
+							<exclude name="**/*-rto*.sql"/>
+						</fileset>
+						<loadfile property="db.dbcr.files.list" srcfile="${dbcrSqlOutputFile}">
+							<filterchain>
+								<linecontains negate="true">
+									<contains value="-rto"/>
+								</linecontains>
+								<striplinebreaks/>
+								<tokenfilter>
+									<ignoreblank/>
+									<linetokenizer/>
+									<replacestring from=".sql" to=".sql,"/>
+									<replacestring from=".SQL" to=".SQL,"/>
+								</tokenfilter>
+							</filterchain>
+						</loadfile>
+					</then>
+					<!--
+ Create list of sql files available in build packet and another list for sqls already applied on environment
+		 Only get files which are NOT authoring only (filename containing 'ato') and NOT being covered by stageprop (filename containing 'stg')
+		 Only run when the apply_dbcr_types property is set to Live 
+					-->
+					<elseif>
+						<contains string="${apply_dbcr_types}" substring="LIVE" casesensitive="false"/>
+						<then>
+							<fileset id="resource.dir.dbcr.files.list" dir="${dataload.sql.common.dir}">
+								<include name="**/*.sql"/>
+								<include name="**/*.SQL"/>
+								<exclude name="rollback/*"/>
+								<exclude name="**/updateDBConfigurations.sql"/>
+								<exclude name="**/*-ato*.sql"/>
+								<exclude name="**/*-stg*.sql"/>
+							</fileset>
+							<loadfile property="db.dbcr.files.list" srcfile="${dbcrSqlOutputFile}">
+								<filterchain>
+									<linecontains negate="true">
+										<contains value="stg"/>
+									</linecontains>
+									<linecontains negate="true">
+										<contains value="-ato"/>
+									</linecontains>
+									<striplinebreaks/>
+									<tokenfilter>
+										<ignoreblank/>
+										<linetokenizer/>
+										<replacestring from=".sql" to=".sql,"/>
+										<replacestring from=".SQL" to=".SQL,"/>
+									</tokenfilter>
+								</filterchain>
+							</loadfile>
+						</then>
+					</elseif>
+					<!--
+ Create list of sql files available in build packet and another list for sqls already applied on environment
+		 Only get files which are NOT authoring only (filename containing 'ato')
+		 Only run when the apply_dbcr_types property is set to Live (filename does not contain 'ato' or 'stg') 
+					-->
+					<elseif>
+						<contains string="${apply_dbcr_types}" substring="ALL" casesensitive="false"/>
+						<then>
+							<fileset id="resource.dir.dbcr.files.list" dir="${dataload.sql.common.dir}">
+								<include name="**/*.sql"/>
+								<include name="**/*.SQL"/>
+								<exclude name="rollback/*"/>
+								<exclude name="**/updateDBConfigurations.sql"/>
+								<exclude name="**/*-ato*.sql"/>
+							</fileset>
+							<loadfile property="db.dbcr.files.list" srcfile="${dbcrSqlOutputFile}">
+								<filterchain>
+									<linecontains negate="true">
+										<contains value="-ato"/>
+									</linecontains>
+									<striplinebreaks/>
+									<tokenfilter>
+										<ignoreblank/>
+										<linetokenizer/>
+										<replacestring from=".sql" to=".sql,"/>
+										<replacestring from=".SQL" to=".SQL,"/>
+									</tokenfilter>
+								</filterchain>
+							</loadfile>
+						</then>
+					</elseif>
+					<else>
+						<fail message="Either the property ...apply_dbcr_types... is not provided or the value ${apply_dbcr_types} does not match to one of the value from list ALL | LIVE | AUTH"/>
+					</else>
+				</if>
+			</then>
+			<else>
+				<fail message="Either the property ...apply_dbcr_types... is not provided or the value is empty, hence failing the build"/>
+			</else>
+		</if>
+		<!-- To check if the property which contains the list of dbcr's applied on the system, found by quering the DB is empty or not -->
+		<condition property="db.dbcr.files.list" value="">
+			<not>
+				<isset property="db.dbcr.files.list"/>
+			</not>
+		</condition>
+		<!-- Get the list of list of files already applied on the system -->
+		<filelist id="resource.db.dbcr.files.list" dir="${dataload.sql.common.dir}" files="${db.dbcr.files.list}"/>
+		<!-- Get the diff between two lists created above to get the files which actually needs to be applied on the system. -->
+		<difference id="dbcrDifference">
+			<resources refid="resource.db.dbcr.files.list"/>
+			<resources refid="resource.dir.dbcr.files.list"/>
+		</difference>
+		<!--
+ Check if the files in the diff exist in the deployment packet.
+     Fail the build if any of the file does not exist in the packset 
+		-->
+		<var name="break.build" value="false"/>
+		<for param="check.file.name" delimiter=";">
+			<path>
+				<pathelement path="${toString:dbcrDifference}"/>
+			</path>
+			<sequential>
+				<property name="is.present" value="false"/>
+				<available type="file" file="@{check.file.name}" property="is.present"/>
+				<echo>Filename: "@{check.file.name} - Exists: ${is.present}</echo>
+				<if>
+					<equals arg1="${is.present}" arg2="false"/>
+					<then>
+						<var name="break.build" value="true"/>
+					</then>
+				</if>
+			</sequential>
+		</for>
+		<echo message="Value of break..build for DBCR's: ${break.build}"/>
+		<!-- check if anyone of the file does not exist and break the build if true -->
+		<fail message="Build failed as one of the SQL files does not exist">
+			<condition>
+				<istrue value="${break.build}"/>
+			</condition>
+		</fail>
+		<!-- Remove path from the files list -->
+		<pathconvert pathsep="," property="final.dbcr.files.list" refid="dbcrDifference">
+			<mapper type="flatten"/>
+		</pathconvert>
+		<echo>The final list of dbcr's files which needs to be applied: ${final.dbcr.files.list}</echo>
+		<condition property="checkDBCREmptyList">
+			<and>
+				<length string="${final.dbcr.files.list}" trim="true" when="greater" length="0"/>
+			</and>
+		</condition>
+		<!--
+ Update run.dataload.sql.common property and set it to TRUE if there is a difference found between DBCRs in build packet vs. already applied.
+		 Set it to FALSE if no difference found	
+		-->
+		<if>
+			<equals arg1="${checkDBCREmptyList}" arg2="true"/>
+			<then>
+				<echo message="The dbcr diff is not empty hence will execute the sql dataload target"/>
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="run.dataload.sql.common=(.*)" replace="run.dataload.sql.common=true" byline="true"/>
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="dataload.sql.common.ordered.list=(.*)" replace="dataload.sql.common.ordered.list=${final.dbcr.files.list}" byline="true"/>
+			</then>
+			<else>
+				<echo message="The dbcr diff is empty hence will not execte the sql dataload target"/>
+				<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="run.dataload.sql.common=(.*)" replace="run.dataload.sql.common=false" byline="true"/>
+			</else>
+		</if>
+		<delete file="${dbcrSqlOutputFile}"/>
+		</then>
+		</if>
+	</target>
+	<!-- macrodef to calulcate the delta list which needs to be applied on the specific env. Can be used for various types of dataloads. -->
+	<macrodef name="dataloadRun">
+		<attribute name="sqlOutputFile"/>
+		<attribute name="dtldType"/>
+		<attribute name="dtldFolder"/>
+		<attribute name="propertyRunKey"/>
+		<attribute name="propertyIncludeKey"/>
+		<sequential>
+			<trycatch property="Err.msg">
+				<try>
+					<if>
+						<equals arg1="@{dtldType}" arg2="python" />
+						<then>
+							<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false" output="@{sqlOutputFile}">select xcrtracker.artifact_id from xcrtracker where env_name='${target.env}';</sql>
+						</then>
+						<else>
+							<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false" output="@{sqlOutputFile}">select xdataloadtracker.filename from xdataloadtracker where dataload_type='@{dtldType}';</sql>
+						</else>
+					</if>
+				</try>
+				<catch>
+					<failNL bundle="wcbd-deploy-messages" key="ERR_TEST_DB">
+						<arg value="${Err.msg}"/>
+					</failNL>
+				</catch>
+			</trycatch>
+			<if>
+						<equals arg1="@{dtldType}" arg2="python" />
+						<then>
+							<fileset id="resource.dir.files.list" dir="@{dtldFolder}">
+								<include name="CR*.py"/>
+								<include name="CR*.PY"/>
+							</fileset>
+						</then>
+						<else>
+							<fileset id="resource.dir.files.list" dir="@{dtldFolder}">
+								<include name="*.xml"/>
+								<include name="*.XML"/>
+							</fileset>
+						</else>
+			</if>
+			<loadfile property="db.files.list" srcfile="@{sqlOutputFile}">
+				<filterchain>
+					<striplinebreaks/>
+					<tokenfilter>
+						<ignoreblank/>
+						<linetokenizer/>
+						<replacestring from=".xml" to=".xml,"/>
+						<replacestring from=".XML" to=".XML,"/>
+						<replacestring from=".py" to=".py,"/>
+						<replacestring from=".PY" to=".PY,"/>
+					</tokenfilter>
+				</filterchain>
+			</loadfile>
+			<condition property="db.files.list" value="">
+				<not>
+					<isset property="db.files.list"/>
+				</not>
+			</condition>
+			<filelist id="resource.db.files.list" dir="@{dtldFolder}" files="${db.files.list}"/>
+			<difference id="difference">
+				<resources refid="resource.db.files.list"/>
+				<resources refid="resource.dir.files.list"/>
+			</difference>
+			<!--
+ Check if the files in the diff exist in the deployment packet.
+     Fail the build if any of the file does not exist in the packet 
+			-->
+			<var name="break.build.dataload" value="false"/>
+			<for param="check.file.name.dataload" delimiter=";">
+				<path>
+					<pathelement path="${toString:difference}"/>
+				</path>
+				<sequential>
+					<property name="is.dataload.file.present" value="false"/>
+					<available type="file" file="@{check.file.name.dataload}" property="is.dataload.file.present"/>
+					<echo>Filename: "@{check.file.name.dataload} - Exists: ${is.dataload.file.present}</echo>
+					<if>
+						<equals arg1="${is.dataload.file.present}" arg2="false"/>
+						<then>
+							<var name="break.build.dataload" value="true"/>
+						</then>
+					</if>
+				</sequential>
+			</for>
+			<echo message="Value of break..build for Dataload type @{dtldType}: ${break.build.dataload}"/>
+			<!-- check if anyone of the file does not exist and break the build if true -->
+			<fail message="Build failed as one of the Dataload or Python CR files does not exist">
+				<condition>
+					<istrue value="${break.build.dataload}"/>
+				</condition>
+			</fail>
+			<!-- Remove path from the files list -->
+			<pathconvert pathsep="," property="final.files.list" refid="difference">
+				<mapper type="flatten"/>
+			</pathconvert>
+			<echo>The final list of dataload/Python CR @{dtldType} files which needs to be applied: ${final.files.list}</echo>
+			<condition property="checkEmptyList">
+				<and>
+					<length string="${final.files.list}" trim="true" when="greater" length="0"/>
+				</and>
+			</condition>
+			<if>
+				<equals arg1="${checkEmptyList}" arg2="true"/>
+				<then>
+					<echo>The @{dtldType} diff is not empty hence will execute the @{dtldType} dataload target</echo>
+					<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="@{propertyRunKey}=(.*)" replace="@{propertyRunKey}=true" byline="true"/>
+					<replaceregexp file="${basedir}/common.properties" match="@{propertyRunKey}=(.*)" replace="@{propertyRunKey}=true" byline="true"/>
+					
+					<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="@{propertyIncludeKey}=(.*)" replace="@{propertyIncludeKey}=${final.files.list}" byline="true"/>
+					<replaceregexp file="${basedir}/common.properties" match="@{propertyIncludeKey}=(.*)" replace="@{propertyIncludeKey}=${final.files.list}" byline="true"/>
+				</then>
+				<else>
+					<echo message="The @{dtldType} diff is empty hence will not execute the @{dtldType} target"/>
+					<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="@{propertyRunKey}=(.*)" replace="@{propertyRunKey}=false" byline="true"/>
+					<replaceregexp file="${basedir}/common.properties" match="@{propertyRunKey}=(.*)" replace="@{propertyRunKey}=false" byline="true"/>
+					<replaceregexp file="${basedir}/deploy-${target.env}.properties" match="@{propertyIncludeKey}=(.*)" replace="@{propertyIncludeKey}=${final.files.list}" byline="true"/>
+					<replaceregexp file="${basedir}/common.properties" match="@{propertyIncludeKey}=(.*)" replace="@{propertyIncludeKey}=${final.files.list}" byline="true"/>
+				</else>
+			</if>
+			<delete file="@{sqlOutputFile}"/>
+			<!--
+ Unsetting all the global variables as the same macrodef will be used by another 
+     target and we dont want these values to be set for the previous run         
+			-->
+			<var name="resource.dir.files.list" unset="true"/>
+			<var name="resource.db.files.list" unset="true"/>
+			<var name="db.files.list" unset="true"/>
+			<var name="final.files.list" unset="true"/>
+			<var name="checkEmptyList" unset="true"/>
+			<var name="break.build.dataload" unset="true"/>
+			<var name="is.dataload.file.present" unset="true"/>
+		</sequential>
+	</macrodef>
+	<!-- This target call the dataloadRun macrodef to calulcate the delta list of acp files which needs to be applied on the specific env. -->
+	<target name="run-acp-diff-update-target-env-porperties">
+	<if>
+			<equals arg1="${run.dataload.acp.common}" arg2="true" />
+			<then>
+				<dataloadRun sqlOutputFile="acpSqlOutput" dtldType="acp" dtldFolder="${dataload.acp.common.dir}" propertyRunKey="run.dataload.acp.common" propertyIncludeKey="dataload.acp.common.fileset.includes"/>
+			</then>
+			<else>
+			    <echo message="Skipping run of ACP policy's as run.dataload.acp.common is set to false" level="info" />
+			</else>
+	</if>
+	</target>
+	
+	<!-- This target call the dataloadRun macrodef to calulcate the delta list of massload files which needs to be applied on the specific env. -->
+	<target name="run-massload-diff-update-target-env-porperties" >
+	<if>
+			<equals arg1="${run.dataload.xml.common}" arg2="true" />
+			<then>
+				<dataloadRun sqlOutputFile="massSqlOutput" dtldType="mass" dtldFolder="${dataload.xml.common.dir}" propertyRunKey="run.dataload.xml.common" propertyIncludeKey="dataload.xml.common.fileset.includes"/>
+			</then>
+			<else>
+			    <echo message="Skipping run of massload policy's as run.dataload.xml.common is set to false" level="info" />
+			</else>
+	</if>				
+	</target>
+	
+	<!-- This target call the dataloadRun macrodef to calulcate the delta list of acug files which needs to be applied on the specific env. -->
+	<target name="run-acug-diff-update-target-env-porperties" >
+	<if>
+			<equals arg1="${run.dataload.acug.common}" arg2="true" />
+			<then>
+				<dataloadRun sqlOutputFile="acugSqlOutput" dtldType="acug" dtldFolder="${dataload.acug.common.dir}" propertyRunKey="run.dataload.acug.common" propertyIncludeKey="dataload.acug.common.fileset.includes"/>
+            </then>
+			<else>
+			    <echo message="Skipping run of acug policy's as run.dataload.acug.common is set to false" level="info" />
+			</else>	
+    </if>			
+	</target>
+	
+	<target name="run-python-cr-diff-update-target-env-porperties">
+		<if>
+			<equals arg1="${run.custom.was.py.config}" arg2="false" />
+			<then>
+				<echo message="Skipping the WAS custom Python Execution Step as it's execution is set to false" level="info" />
+			</then>
+			<else>
+				<dataloadRun sqlOutputFile="pythonCRSqlOutput" dtldType="python" dtldFolder="${python.cr.common.dir}" propertyRunKey="run.python.cr.common" propertyIncludeKey="python.cr.common.fileset.includes"/>
+			</else>
+		</if>
+	</target>
+	
+	<!-- Replace TOBEPROVIDED with blank string in all properties file and wc-server.xml -->
+	<target name="replace-tobeProvided">
+		<replace dir="${basedir}" value="">
+			<include name="*.properties"/>
+			<replacetoken>TOBEPROVIDED</replacetoken>
+		</replace>
+		<replace dir="${basedir}/source/wc.ear/xml/config" value="">
+			<include name="wc-server.xml"/>
+			<replacetoken>TOBEPROVIDED</replacetoken>
+		</replace>
+	</target>
+	<!--
+ **************************************************************************
+** The macrodef updateDBForDataloadFiles is used for dataload utilities like **
+** acp, mass and acug files. The macrodef takes two parameter and populate   **
+** the dataloadtracker table with the dataload type applied on the env.      **
+*************************************************************************** 
+	-->
+	<macrodef name="updateDBForDataloadFiles">
+		<attribute name="propertyIncludeKey"/>
+		<attribute name="dtldType"/>
+		<sequential>
+			<for list="${@{propertyIncludeKey}}" param="file" delimiter=",">
+				<sequential>
+					<trycatch property="insertErr.msg">
+						<try>
+							<if>
+								<equals arg1="@{dtldType}" arg2="python" />
+							<then>
+								<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false">INSERT INTO XCRTRACKER (artifact_id, product, description, status, created_date, last_updated, reference_doc, applied_by, build_label, env_name) VALUES ('@{file}', 'WCS', 'Python CR Applied by Automated Build', 'COMPLETED', SYSDATE, SYSDATE, 'None', 'Automated Build', '${build.label}', '${target.env}');</sql>
+							</then>
+							<else>
+								<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false">INSERT INTO XDATALOADTRACKER (filename, dataload_type, build_label, created_date, last_updated) VALUES ('@{file}', '@{dtldType}', '${build.label}' , SYSDATE, SYSDATE);</sql>
+							</else>
+							</if>
+						</try>
+						<catch>
+							<failNL bundle="wcbd-deploy-messages" key="ERR_TEST_DB">
+								<arg value="${insertErr.msg}"/>
+							</failNL>
+						</catch>
+					</trycatch>
+				</sequential>
+			</for>
+		</sequential>
+	</macrodef>
+	<!--
+ **************************************************************************
+** This target call's the macrodef updateDBForDataloadFiles for acp, mass    **
+** and acug files. The macrodef takes two parameter and populate the         **
+** dataloadtracker table with the dataload applied on the env.               **
+*************************************************************************** -->
+
+<target name="post-deploy" depends="execute-wcs-config-py">
+	<!-- Run the DB configuration SQL file to update all configurations based on latest values -->
+	<if>
+		<or>
+		<contains string="${target.env}" substring="h8prod" />
+		<contains string="${target.env}" substring="sit3b" />
+		<contains string="${target.env}" substring="vnb" />
+		</or>
+    <then>
+        <property name="hall.name" value="HALL2" />
+    </then>
+    <else>
+		<property name="hall.name" value="HALL1" />
+    </else>
+	</if>
+	<if>
+		<equals arg1="${run.dataload.sql.common}" arg2="true" />
+		<then>
+			<antcall target="dataload.sql">
+				<param name="src.file" value="${dataload.sql.common.dir}/updateDBConfigurations.sql" />
+				<param name="sql.onerror" value="abort" />
+			</antcall>
+		</then>
+	</if>
+	
+	<!-- Task to update Moniker value during deployment -->
+	
+	<sql driver="${jdbc.driver}"
+			 url="${jdbc.url}"
+			 userid="${db.user.name}"
+			 password="${db.user.password}"
+			 print="true"
+			 onerror="abort"
+			 classpath="${jdbc.driver.path}"
+			 showtrailers="false" showheaders="false" expandproperties="true"
+			 delimiter="/">
+				 DECLARE
+					v_Return VARCHAR2(200);
+				 BEGIN
+				 	v_Return := UTILITY_PACKAGE.UPDATE_MONIKER('${hall.name}') ;
+				 END;
+				 /
+	</sql>
+	
+	<if>
+		<equals arg1="${run.dataload.acp.common}" arg2="true" />
+		<then>
+			<updateDBForDataloadFiles propertyIncludeKey="dataload.acp.common.fileset.includes" dtldType="acp" />
+		</then>
+	</if>
+	
+	<if>
+		<equals arg1="${run.dataload.acug.common}" arg2="true" />
+		<then>
+			<updateDBForDataloadFiles propertyIncludeKey="dataload.acug.common.fileset.includes" dtldType="acug" />
+		</then>
+	</if>
+	
+	<if>
+		<equals arg1="${run.dataload.xml.common}" arg2="true" />
+		<then>
+			<updateDBForDataloadFiles propertyIncludeKey="dataload.xml.common.fileset.includes" dtldType="mass" />
+		</then>
+	</if>
+	
+	
+	<if>
+		<equals arg1="${run.python.cr.common}" arg2="true" />
+		<then>
+			<updateDBForDataloadFiles propertyIncludeKey="python.cr.common.fileset.includes" dtldType="python" />
+		</then>
+	</if>
+	<antcall target="echo.unapplied.cr" />
+</target>
+
+ <!--***********************************************************************
+	** Exceutes the custom wsadmin scripts for configuring websphere application
+	** server objects like queues, JVM aruguments etc required for MCFP
+	** application.
+	**************************************************************************
+	-->
+	<target name="execute-wcs-config-py">
+		<if>
+			<equals arg1="${run.custom.was.py.config}" arg2="true"/>
+			<then>
+				<echo message="As property run.custom.was.py.config is set to true, executing the target execute-wcs-config-py" level="info"/>
+		<replace dir="${wsadmin.script.dir}" replacefilterfile="${wcs.ext.props.path}/external.properties">
+			<include name="**/mns*.py"/>
+			<include name="**/CR*.py"/>
+			<exclude name="wcbd-*.py"/>
+		</replace>
+		<replace dir="${wsadmin.script.dir}" replacefilterfile="${basedir}/${target.env}.properties">
+			<include name="**/mns*.py"/>
+			<include name="**/CR*.py"/>
+			<exclude name="wcbd-*.py"/>
+		</replace>
+		<replace dir="${wsadmin.script.dir}" replacefilterfile="${basedir}/deploy-${target.env}.properties">
+			<include name="**/mns*.py"/>
+			<include name="**/CR*.py"/>
+			<exclude name="wcbd-*.py"/>
+		</replace>
+		
+		<taskdef name="wsadmin" classname="com.ibm.websphere.ant.tasks.WsAdmin" classpathref="was.class.path"/>
+		
+						<!--
+ Iterate through the scripts folder and run all wsadmin
+			scripts with mns prefix 
+				-->
+				<for list="${was.host.list}" param="was.host">
+					<sequential>
+							<for param="mns-wsadmin-script">
+									<path>
+										<fileset id="list.wsadmin.scripts" dir="${wsadmin.script.dir}" includes="${python.cr.common.fileset.includes}">
+											<include name="**/mns*.py"/>
+											<exclude name="wcbd*-.py"/>
+										</fileset>
+									</path>
+								<sequential>
+									<trycatch property="wsadmin.script.failure" >
+										<try>
+											<antcall target="execute-wcs-config-py-internal" inheritAll="true">
+												<param name="param_mns-wsadmin-script" value="@{mns-wsadmin-script}"/>
+												<param name="param_was.host" value="@{was.host}"/>
+											</antcall>
+										</try>
+					
+										<catch>
+											<echo> The execute-wcs-config-py target failed due to failure message --- ${wsadmin.script.failure} </echo>
+											<input message="Please check the failure message above and trying fix in the backend if possible. Once the issue is fixed please press Return key to continue... with running the failed target again"/>
+											<antcall target="execute-wcs-config-py-internal" inheritAll="true">
+												<param name="param_mns-wsadmin-script" value="@{mns-wsadmin-script}"/>
+												<param name="param_was.host" value="@{was.host}"/>
+											</antcall>
+										</catch>	
+									</trycatch>
+								</sequential>
+							</for>
+					</sequential>
+				</for>	
+						</then>
+			<else>
+				<echo message="As property run.custom.was.py.config is set to ${run.custom.was.py.config}, skipping the target execute-wcs-config-py" level="info"/>
+			</else>
+		</if>
+	</target>
+	
+	<target name="execute-wcs-config-py-internal" >
+		<echo message="Executing script ${param_mns-wsadmin-script}"/>
+		<wsadmin script="${param_mns-wsadmin-script}" lang="jython" failonerror="true" wasHome="${was.home}" host="${param_was.host}" conntype="${was.conntype}" port="${was.port}" user="${was.user}" password="${was.password}" profileName="${was.profile.name}" jvmMaxMemory="${was.jvm.max.memory}"/>
+    </target>	
+	
+	
+<target name="echo.unapplied.cr">
+	<trycatch property="crErr.msg">
+		<try>
+			<sql driver="${jdbc.driver}" url="${jdbc.url}" userid="${db.user.name}" password="${db.user.password}" classpath="${jdbc.driver.path}" print="true" showtrailers="false" showheaders="false">SELECT 'Artifact ID for CR : ' || xcrtracker.artifact_id || '. CR to be applied on product : ' || xcrtracker.product || '. Title : ' || xcrtracker.description || '. Reference document for this CR is ' || xcrtracker.reference_doc FROM xcrtracker WHERE upper (status) = 'NEW' ;</sql>
+		</try>
+		<catch>
+			<!--fail message="Error while retrieving unapplied CRs. Error was: ${crErr.msg}" /-->
+			<echo message="Error while retrieving unapplied CRs. Error was: ${crErr.msg}"/>
+		</catch>
+	</trycatch>
+</target>
+
+<target name="copy-fear-assets">
+	<copy todir="${fear.res.dir}" preservelastmodified="true" overwrite="true" >
+			<fileset dir="${source.dir}/res/mustache" >
+			</fileset>
+	</copy>
+</target>
+
+<target name="create-node-server-list">
+	<taskdef name="wsadmin" classname="com.ibm.websphere.ant.tasks.WsAdmin" classpathref="was.class.path"/>
+	<for list="${was.host.list}" param="was.host">
+		<sequential>
+			<wsadmin wasHome="${was.home}"
+					 properties="${wsadmin.properties.file}"
+					 profileName="${was.profile.name}"
+					 script="${wsadmin.script.dir}/wcbd-creatNodeServerList.py"
+					 lang="jython"
+					 conntype="${was.conntype}"
+					 host="@{was.host}"
+					 port="${was.port}"
+					 user="${was.user}"
+					 password="${was.password}"
+					 jvmMaxMemory="${was.jvm.max.memory}"
+					 failonerror="true">
+				<arg value="${basedir}/nodeGroups.properties" />
+				<arg value="${run.rolling.restart}" />
+			</wsadmin>
+		</sequential>
+	</for>
+</target>
+
+<target name="stop-sync-start">
+	<taskdef name="wsadmin" classname="com.ibm.websphere.ant.tasks.WsAdmin" classpathref="was.class.path"/>
+	<for list="${was.host.list}" param="was.host">
+		<sequential>
+			<wsadmin wasHome="${was.home}"
+					 properties="${wsadmin.properties.file}"
+					 profileName="${was.profile.name}"
+					 script="${wsadmin.script.dir}/wcbd-stopStartSync.py"
+					 lang="jython"
+					 conntype="${was.conntype}"
+					 host="@{was.host}"
+					 port="${was.port}"
+					 user="${was.user}"
+					 password="${was.password}"
+					 jvmMaxMemory="${was.jvm.max.memory}"
+					 failonerror="true">
+				<arg value="${basedir}/nodeGroups.properties" />
+				<arg value="${run.rolling.restart}" />
+			</wsadmin>
+		</sequential>
+	</for>
+</target>
+
+<!-- Main Target which calls all patch submodules targets -->	
+<target name="patch-deploy" depends="patch-sql-deploy"/>
+
+<!-- Target for sql patch deployment -->	
+<target name="patch-sql-deploy" depends="add-inserts-to-dbcrs,replace-dbcr-tokens,patch.find.dbcrs.execute"/>
+
+<target name="patch.run.sql.list">
+	<antcall target="dataload.sql">
+		<param name="src.file" value="${src.file}" />
+		<param name="sql.onerror" value="abort" />
+	</antcall>			 
+</target>
+
+<target name="patch.find.dbcrs.execute">
+ <!-- Create list of sql files available in build packet and another list for sqls already applied on environment
+	  Only get files which are NOT runtime only (filename containing 'rto')
+	  Only run when the apply_dbcr_types property is set to Auth  -->
+					<if>
+					<equals arg1="${target.instance}" arg2="author" />
+					<then>
+						<fileset id="resource.dir.dbcr.files.list" dir="${dataload.sql.dir}">
+							<include name="**/*.sql"/>
+							<include name="**/*.SQL"/>
+							<exclude name="rollback/*"/>
+							<exclude name="**/updateDBConfigurations.sql"/>
+							<exclude name="**/*-rto*.sql"/>
+						</fileset>
+					</then>
+<!-- Create list of sql files available in build packet and another list for sqls already applied on environment
+	 Only get files which are NOT authoring only (filename containing 'ato') and NOT being covered by stageprop (filename containing 'stg')
+	 Only run when the apply_dbcr_types property is set to Live  -->
+					<elseif>
+						<equals arg1="${target.instance}" arg2="guest" />
+						<then>
+							<fileset id="resource.dir.dbcr.files.list" dir="${dataload.sql.dir}">
+								<include name="**/*.sql"/>
+								<include name="**/*.SQL"/>
+								<exclude name="rollback/*"/>
+								<exclude name="**/updateDBConfigurations.sql"/>
+								<exclude name="**/*-ato*.sql"/>
+								<exclude name="**/*-stg*.sql"/>
+							</fileset>
+						</then>
+					</elseif>
+				<else>
+				<fail message="Either the property instanceType is not provided or the value is empty, hence failing the build"/>
+			</else>
+		</if>
+	
+	<!-- Running the dbcrs -->
+	<foreach target="patch.run.sql.list" param="src.file">
+		<fileset refid="resource.dir.dbcr.files.list"/>
+	</foreach>
+
+</target>
+
+</project>
