@@ -1,4 +1,4 @@
-# Infra-Addons
+# Automated DBCR Approach
 
 As part of the Infrastructure team we come accross various challenges in implementing the Continous Integration cycle in a project. One such challenge was to automate the incremental DBCR process with each run of CI cycle so that the development team is provided with immediate feedback of check-in's and are well aware of any Integration issues much before the sprint delivery.
 
