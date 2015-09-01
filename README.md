@@ -1,8 +1,6 @@
 # Infra-Addons
 
-As part of the Infratructure team we come accross various challenges in implementing the Continous Integration cycle in a project.
-One such challenge was to automate the incremental DBCR process with each run of the CI cycle so that the development team is provided with immediate feedback 
-of the check-in's and are well aware of any Integration issues much before the sprint delivery.
+As part of the Infrastructure team we come accross various challenges in implementing the Continous Integration cycle in a project. One such challenge was to automate the incremental DBCR process with each run of CI cycle so that the development team is provided with immediate feedback of check-in's and are well aware of any Integration issues much before the sprint delivery.
 
 #General DBCR process
 
@@ -37,5 +35,19 @@ single script to run the delta is manual and error prone task.
 At times one team member is aligned to perform daily deployments.
 
 3. Excel or another tool is used to manually find delta of DBCR’s to be applied to the destination environment during build phase, instead of deploy phase.
+
+#Solution – DBCR File naming convention
+
+1. Solution approach described pivots on the file naming convention used to name the approved DBCR files
+
+2. Once a DBCR is approved it is added to SCM tool and the file is named as timestamp: - YYYYMMDDHHmm-<<RS ID>>.sql.
+
+3. Minutes (mm) in the filename can be used to sequence the DBCR while they are being applied.
+
+Example: 201502011600-323232.sql file represents a DBCR (323232) that has been approved on 1st Feb 2015 at 4:00 PM
+
+
+
+
 
 
